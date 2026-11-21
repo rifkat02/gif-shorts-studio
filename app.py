@@ -2,6 +2,11 @@ import os
 import tempfile
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+# Совместимость MoviePy 1.0.3 с новыми версиями Pillow (где удалили Image.ANTIALIAS)
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
 import streamlit as st
 from moviepy.editor import (
     AudioFileClip,
