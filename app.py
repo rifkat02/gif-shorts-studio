@@ -1,7 +1,7 @@
 import os
 import tempfile
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence
 
 # Совместимость MoviePy 1.0.3 с новыми версиями Pillow (где удалили Image.ANTIALIAS)
 if not hasattr(Image, "ANTIALIAS"):
@@ -12,7 +12,7 @@ from moviepy.editor import (
     AudioFileClip,
     CompositeVideoClip,
     ImageClip,
-    VideoFileClip,
+    ImageSequenceClip,
     concatenate_videoclips,
     vfx,
 )
@@ -63,7 +63,7 @@ st.markdown(
 )
 
 st.title("🎬 GIF → TikTok / Shorts Studio")
-st.caption("Бесшовный цикл, текст/хук для ролика, музыка, водяной знак и быстрый экспорт.")
+st.caption("Склейка нескольких GIF, бесшовный цикл, текст/хук, музыка и водяной знак.")
 
 
 def load_font(size: int):
@@ -175,24 +175,89 @@ def make_blurred_background(frame: np.ndarray, target_w: int = 1080, target_h: i
     return np.array(bg)
 
 
+def load_gif_clip(gif_path: str, loop_mode: str, target_size: tuple[int, int] | None = None) -> ImageSequenceClip:
+    """Читает кадры GIF через Pillow, собирает цикл и при необходимости приводит к общему размеру."""
+    with Image.open(gif_path) as im:
+        durations_ms = []
+        pil_frames = []
+        for frame in ImageSequence.Iterator(im):
+            durations_ms.append(frame.info.get("duration", 100))
+            pil_frames.append(frame.convert("RGB"))
+
+    if not pil_frames:
+        raise ValueError("Не удалось прочитать кадры из GIF-файла.")
+
+    if target_size is not None:
+        tw, th = target_size
+        pil_frames = [
+            f.resize((tw, th), Image.Resampling.LANCZOS) if f.size != (tw, th) else f
+            for f in pil_frames
+        ]
+
+    rgb_frames = [np.array(f) for f in pil_frames]
+
+    avg_duration_ms = sum(durations_ms) / len(durations_ms) if durations_ms else 100.0
+    if avg_duration_ms < 20:
+        avg_duration_ms = 100.0
+    fps = max(8.0, min(30.0, 1000.0 / avg_duration_ms))
+
+    if loop_mode == "Ping-Pong (Бумеранг)" and len(rgb_frames) > 2:
+        sequence = rgb_frames + rgb_frames[-2:0:-1]
+    elif loop_mode == "Ping-Pong (Бумеранг)" and len(rgb_frames) == 2:
+        sequence = rgb_frames + [rgb_frames[0]]
+    else:
+        sequence = rgb_frames
+
+    return ImageSequenceClip(sequence, fps=fps)
+
+
+def build_combined_gif_clip(gif_paths: list[str], loop_mode: str):
+    """Склеивает несколько GIF в один клип с общим размером кадров для безопасного concatenate."""
+    sizes = []
+    for p in gif_paths:
+        with Image.open(p) as im:
+            sizes.append(im.size)
+
+    # Берём максимальные размеры среди загруженных GIF, чтобы ничего не обрезалось на этапе склейки
+    common_w = max(w for w, _ in sizes)
+    common_h = max(h for _, h in sizes)
+    common_size = (common_w, common_h)
+
+    clips = [load_gif_clip(p, loop_mode, target_size=common_size) for p in gif_paths]
+    if len(clips) == 1:
+        return clips[0]
+
+    # Приводим клипы к единому FPS перед конкатенацией
+    target_fps = max(c.fps for c in clips)
+    normalized = [c.set_fps(target_fps) for c in clips]
+    return concatenate_videoclips(normalized, method="compose")
+
+
 # --- 1. ЗАГРУЗКА ФАЙЛОВ ---
 st.subheader("1. Файлы")
-gif_file = st.file_uploader("GIF-анимация", type=["gif"])
+gif_files = st.file_uploader(
+    "GIF-анимации (можно выбрать сразу несколько)",
+    type=["gif"],
+    accept_multiple_files=True,
+)
+if gif_files:
+    st.caption(f"Выбрано GIF: {len(gif_files)} шт. — они будут идти по очереди в загруженном порядке.")
+
 audio_file = st.file_uploader("Аудиодорожка (MP3 / WAV)", type=["mp3", "wav"])
 
 # --- 2. ЦИКЛ, ФОРМАТ И ДЛИТЕЛЬНОСТЬ ---
 st.subheader("2. Цикл и формат")
 loop_mode = st.selectbox(
-    "Бесшовный цикл",
+    "Бесшовный цикл каждого GIF",
     ["Ping-Pong (Бумеранг)", "Обычный повтор (Loop)"],
-    help="Ping-Pong проигрывает GIF вперед и назад — стык почти незаметен.",
+    help="Ping-Pong проигрывает каждый GIF вперед и назад перед переходом к следующему.",
 )
 format_mode = st.selectbox(
     "Формат кадра",
     [
         "9:16 (TikTok / Shorts) с размытым фоном",
         "9:16 (Заполнение / Crop)",
-        "Оригинальный размер GIF",
+        "Оригинальный размер",
     ],
 )
 motion_mode = st.selectbox(
@@ -261,26 +326,24 @@ st.divider()
 
 # --- 6. РЕНДЕР ---
 if st.button("🚀 Сгенерировать видео", type="primary", use_container_width=True):
-    if not gif_file:
-        st.error("Сначала загрузите GIF-файл.")
+    if not gif_files:
+        st.error("Сначала загрузите хотя бы один GIF-файл.")
         st.stop()
 
-    with st.spinner("Собираем ролик... Обычно это занимает 15–45 секунд."):
+    if len(gif_files) > 10:
+        st.warning("Для стабильной работы на бесплатном сервере выберите до 10 GIF за один запуск.")
+        st.stop()
+
+    with st.spinner("Собираем ролик из GIF... Обычно это занимает 15–50 секунд."):
         with tempfile.TemporaryDirectory() as tmpdir:
-            gif_path = os.path.join(tmpdir, "input.gif")
-            with open(gif_path, "wb") as f:
-                f.write(gif_file.read())
+            gif_paths = []
+            for idx, gf in enumerate(gif_files):
+                p = os.path.join(tmpdir, f"input_{idx}.gif")
+                with open(p, "wb") as f:
+                    f.write(gf.read())
+                gif_paths.append(p)
 
-            clip = VideoFileClip(gif_path)
-
-            # Бесшовный цикл
-            if loop_mode == "Ping-Pong (Бумеранг)":
-                reversed_clip = clip.fx(vfx.time_mirror)
-                if reversed_clip.duration > 0.2:
-                    reversed_clip = reversed_clip.subclip(0.05, reversed_clip.duration - 0.05)
-                base_loop = concatenate_videoclips([clip, reversed_clip])
-            else:
-                base_loop = clip
+            base_loop = build_combined_gif_clip(gif_paths, loop_mode)
 
             # Аудио и длительность
             audio_clip = None
@@ -387,7 +450,7 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
             output_path = os.path.join(tmpdir, "shorts_output.mp4")
             final_video.write_videofile(
                 output_path,
-                fps=30,
+                fps=24,
                 codec="libx264",
                 audio_codec="aac",
                 preset="fast",
