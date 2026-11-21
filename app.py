@@ -1,4 +1,5 @@
 import os
+import random
 import tempfile
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence
@@ -63,7 +64,37 @@ st.markdown(
 )
 
 st.title("🎬 GIF → TikTok / Shorts Studio")
-st.caption("Склейка нескольких GIF, переходы, бесшовный цикл, текст/хук, музыка и водяной знак.")
+st.caption("Склейка GIF, переходы, пресеты хуков и канала, музыка, водяной знак и текст для публикации.")
+
+HOOK_PRESETS = {
+    "Свой текст": "",
+    "Не делай так…": "Не делай так, если не хочешь потерять результат!",
+    "Разбор за 15 секунд": "Разбираем момент за 15 секунд — смотри до конца",
+    "Когда пошло не по плану": "Когда всё пошло не по плану в самый неподходящий момент",
+    "Итог": "Главный итог, который стоит запомнить",
+}
+
+CHANNEL_PRESETS = {
+    "Свой выбор": None,
+    "TikTok / Shorts (низ-право)": {
+        "wm_position": "bottom-right",
+        "wm_opacity": 0.72,
+        "caption_box": True,
+        "caption_pos": "top",
+    },
+    "Минимализм без плашки": {
+        "wm_position": "top-right",
+        "wm_opacity": 0.55,
+        "caption_box": False,
+        "caption_pos": "top",
+    },
+    "Акцент по центру": {
+        "wm_position": "bottom-left",
+        "wm_opacity": 0.65,
+        "caption_box": True,
+        "caption_pos": "center",
+    },
+}
 
 
 def load_font(size: int):
@@ -178,9 +209,10 @@ def make_blurred_background(frame: np.ndarray, target_w: int = 720, target_h: in
 def load_gif_clip(
     gif_path: str,
     loop_mode: str,
+    speed_mult: float = 1.0,
     target_size: tuple[int, int] | None = None,
 ) -> ImageSequenceClip:
-    """Читает кадры GIF через Pillow, собирает цикл и при необходимости приводит к общему размеру."""
+    """Читает кадры GIF через Pillow, собирает цикл, задаёт скорость и размер."""
     with Image.open(gif_path) as im:
         durations_ms = []
         pil_frames = []
@@ -203,7 +235,8 @@ def load_gif_clip(
     avg_duration_ms = sum(durations_ms) / len(durations_ms) if durations_ms else 100.0
     if avg_duration_ms < 20:
         avg_duration_ms = 100.0
-    fps = max(8.0, min(24.0, 1000.0 / avg_duration_ms))
+    base_fps = max(8.0, min(24.0, 1000.0 / avg_duration_ms))
+    fps = max(6.0, min(30.0, base_fps * float(speed_mult)))
 
     if loop_mode == "Ping-Pong (Бумеранг)" and len(rgb_frames) > 2:
         sequence = rgb_frames + rgb_frames[-2:0:-1]
@@ -218,10 +251,11 @@ def load_gif_clip(
 def build_combined_gif_clip(
     gif_paths: list[str],
     loop_mode: str,
+    speed_mult: float = 1.0,
     transition_mode: str = "Без перехода (стык)",
     fade_duration: float = 0.35,
 ):
-    """Склеивает несколько GIF в один клип с опциональным лёгким crossfade между ними."""
+    """Склеивает несколько GIF в один клип с общим размером кадров и опциональным crossfade."""
     sizes = []
     for p in gif_paths:
         with Image.open(p) as im:
@@ -231,7 +265,10 @@ def build_combined_gif_clip(
     common_h = max(h for _, h in sizes)
     common_size = (common_w, common_h)
 
-    clips = [load_gif_clip(p, loop_mode, target_size=common_size) for p in gif_paths]
+    clips = [
+        load_gif_clip(p, loop_mode, speed_mult=speed_mult, target_size=common_size)
+        for p in gif_paths
+    ]
     if len(clips) == 1:
         return clips[0]
 
@@ -254,6 +291,42 @@ def build_combined_gif_clip(
     return concatenate_videoclips(normalized, method="compose")
 
 
+def estimate_render_seconds(
+    num_gifs: int,
+    duration_sec: float,
+    is_full_hd: bool,
+    has_zoom: bool,
+    has_crossfade: bool,
+) -> tuple[int, int]:
+    """Возвращает примерный диапазон секунд для сборки на слабом контейнере."""
+    base = 6.0 + duration_sec * (1.2 if is_full_hd else 0.55)
+    base += max(0, num_gifs - 1) * 1.5
+    if has_zoom:
+        base *= 1.65
+    if has_crossfade and num_gifs > 1:
+        base *= 1.15
+    low = max(5, int(base * 0.8))
+    high = max(low + 5, int(base * 1.35))
+    return low, high
+
+
+def build_publish_copy(hook_text: str, cta_text: str, wm_text: str) -> str:
+    main_line = hook_text.strip() if hook_text.strip() else "Короткий ролик из GIF"
+    cta_line = cta_text.strip() if cta_text.strip() else ""
+    channel_tag = ""
+    if wm_text.strip().startswith("@"):
+        channel_tag = wm_text.strip().lstrip("@").replace(" ", "")
+    tags = ["#shorts", "#tiktok", "#reels", "#gif", "#нарезка", "#тренды"]
+    if channel_tag:
+        tags.append(f"#{channel_tag}")
+
+    parts = [main_line]
+    if cta_line:
+        parts.append(cta_line)
+    parts.append(" ".join(tags))
+    return "\n\n".join(parts)
+
+
 # --- 1. ЗАГРУЗКА ФАЙЛОВ ---
 st.subheader("1. Файлы")
 gif_files = st.file_uploader(
@@ -261,13 +334,32 @@ gif_files = st.file_uploader(
     type=["gif"],
     accept_multiple_files=True,
 )
+shuffle_gifs = st.checkbox("Перемешать порядок GIF случайно перед сборкой", value=False)
+gif_speed = st.select_slider(
+    "Скорость воспроизведения GIF",
+    options=[0.75, 1.0, 1.25, 1.5],
+    value=1.0,
+    format_func=lambda x: f"{x}x",
+)
+
+total_mb = 0.0
 if gif_files:
-    st.caption(f"Выбрано GIF: {len(gif_files)} шт. — они будут идти по очереди в загруженном порядке.")
+    total_mb += sum(gf.size for gf in gif_files) / (1024 * 1024)
+    st.caption(
+        f"Выбрано GIF: {len(gif_files)} шт. | "
+        f"{'Порядок перемешается случайно' if shuffle_gifs else 'Порядок по списку'} | "
+        f"Темп {gif_speed}x"
+    )
 
 audio_file = st.file_uploader("Аудиодорожка (MP3 / WAV)", type=["mp3", "wav"])
+if audio_file is not None:
+    total_mb += audio_file.size / (1024 * 1024)
 
 # --- 2. ЦИКЛ, ПЕРЕХОДЫ, ФОРМАТ И ДЛИТЕЛЬНОСТЬ ---
 st.subheader("2. Цикл, переходы и формат")
+channel_preset = st.selectbox("Профиль настроек канала", list(CHANNEL_PRESETS.keys()))
+preset_cfg = CHANNEL_PRESETS[channel_preset]
+
 loop_mode = st.selectbox(
     "Бесшовный цикл каждого GIF",
     ["Ping-Pong (Бумеранг)", "Обычный повтор (Loop)"],
@@ -320,25 +412,42 @@ if audio_file is not None:
     audio_volume = st.slider("Громкость трека", min_value=0.0, max_value=1.5, value=0.85, step=0.05)
     audio_start_sec = st.slider("Старт трека с секунды", min_value=0, max_value=60, value=0)
 
-# --- 4. ТЕКСТ / ЗАГОЛОВОК ДЛЯ ШОРТС ---
-st.subheader("4. Текст и хук на видео")
+# --- 4. ТЕКСТ / ЗАГОЛОВОК И CTA ДЛЯ ШОРТС ---
+st.subheader("4. Текст, хук и призыв к действию")
 enable_caption = st.checkbox("Добавить текст / заголовок поверх видео", value=False)
 caption_text = ""
-caption_pos = "top"
+cta_text = ""
+default_pos = preset_cfg["caption_pos"] if preset_cfg else "top"
+default_box = preset_cfg["caption_box"] if preset_cfg else True
+caption_pos = default_pos
 caption_color = "#FFFFFF"
-caption_box = True
+caption_box = default_box
 caption_size = 48
+smooth_text_fade = True
 
 if enable_caption:
+    hook_preset_choice = st.selectbox("Быстрый пресет хука", list(HOOK_PRESETS.keys()))
+    preset_sample = HOOK_PRESETS[hook_preset_choice]
     caption_text = st.text_area(
         "Текст на экране",
+        value=preset_sample,
         placeholder="Например: Когда забыл сохранить проект перед выключением света...",
         height=85,
     )
-    caption_pos = st.selectbox("Позиция текста", ["top", "center", "bottom"])
+    cta_text = st.text_input(
+        "Нижний CTA / титр (необязательно)",
+        placeholder="Например: Подпишись, чтобы не пропустить разбор",
+    )
+    pos_options = ["top", "center", "bottom"]
+    caption_pos = st.selectbox(
+        "Позиция основного текста",
+        pos_options,
+        index=pos_options.index(default_pos) if default_pos in pos_options else 0,
+    )
     caption_color = st.color_picker("Цвет текста", "#FFFFFF")
-    caption_box = st.checkbox("Темная подложка под текст", value=True)
+    caption_box = st.checkbox("Темная подложка под текст", value=default_box)
     caption_size = st.slider("Размер шрифта", min_value=24, max_value=80, value=48)
+    smooth_text_fade = st.checkbox("Плавное появление и затухание текста", value=True)
 
 # --- 5. ВОДЯНОЙ ЗНАК ---
 st.subheader("5. Водяной знак")
@@ -349,21 +458,39 @@ wm_type = st.radio(
 )
 wm_text = ""
 wm_image = None
-wm_opacity = 0.7
-wm_position = "bottom-right"
+default_opacity = preset_cfg["wm_opacity"] if preset_cfg else 0.7
+default_wm_pos = preset_cfg["wm_position"] if preset_cfg else "bottom-right"
+wm_opacity = default_opacity
+wm_position = default_wm_pos
 
 if wm_type != "Без водяного знака":
     if wm_type == "Текст":
         wm_text = st.text_input("Текст водяного знака", value="@my_channel")
     else:
         wm_image = st.file_uploader("Логотип PNG", type=["png"])
+    wm_pos_options = ["bottom-right", "bottom-left", "top-right", "top-left", "center"]
     wm_position = st.selectbox(
         "Позиция знака",
-        ["bottom-right", "bottom-left", "top-right", "top-left", "center"],
+        wm_pos_options,
+        index=wm_pos_options.index(default_wm_pos) if default_wm_pos in wm_pos_options else 0,
     )
-    wm_opacity = st.slider("Прозрачность знака", min_value=0.1, max_value=1.0, value=0.7)
+    wm_opacity = st.slider("Прозрачность знака", min_value=0.1, max_value=1.0, value=default_opacity)
 
 st.divider()
+
+# --- ОЦЕНКА ВЕСА И ВРЕМЕНИ СБОРКИ ---
+approx_dur = float(custom_duration) if (duration_mode == "Фиксированная (сек)" or audio_file is None) else 15.0
+est_low, est_high = estimate_render_seconds(
+    num_gifs=len(gif_files) if gif_files else 1,
+    duration_sec=approx_dur,
+    is_full_hd="1080x1920" in quality_mode,
+    has_zoom=(motion_mode == "Плавный зум (Ken Burns)"),
+    has_crossfade=(transition_mode == "Плавный crossfade"),
+)
+st.caption(
+    f"📦 Размер загруженных файлов: ~{total_mb:.1f} МБ | "
+    f"⏱️ Примерное время рендера: {est_low}–{est_high} сек"
+)
 
 # --- 6. РЕНДЕР ---
 if st.button("🚀 Сгенерировать видео", type="primary", use_container_width=True):
@@ -377,9 +504,13 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
     status_box = st.empty()
     status_box.info("Шаг 1/3: Читаем GIF и собираем цикл...")
 
+    ordered_gifs = list(gif_files)
+    if shuffle_gifs and len(ordered_gifs) > 1:
+        random.shuffle(ordered_gifs)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         gif_paths = []
-        for idx, gf in enumerate(gif_files):
+        for idx, gf in enumerate(ordered_gifs):
             p = os.path.join(tmpdir, f"input_{idx}.gif")
             with open(p, "wb") as f:
                 f.write(gf.read())
@@ -388,6 +519,7 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         base_loop = build_combined_gif_clip(
             gif_paths,
             loop_mode=loop_mode,
+            speed_mult=gif_speed,
             transition_mode=transition_mode,
             fade_duration=fade_duration,
         )
@@ -447,6 +579,9 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         canvas_w, canvas_h = video.w, video.h
         layers = [video.set_position((0, 0))]
 
+        fade_t = min(0.25, target_duration * 0.15) if smooth_text_fade else 0.0
+
+        # Основной текст / хук поверх видео
         if enable_caption and caption_text.strip():
             cap_arr = create_hook_text_image(
                 text=caption_text,
@@ -456,13 +591,31 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
                 box_bg=caption_box,
             )
             cap_clip = ImageClip(cap_arr).set_duration(target_duration)
+            if fade_t > 0:
+                cap_clip = cap_clip.crossfadein(fade_t).crossfadeout(fade_t)
             y_pos_map = {
                 "top": int(canvas_h * 0.12),
                 "center": int((canvas_h - cap_clip.h) * 0.5),
-                "bottom": int(canvas_h * 0.76 - cap_clip.h * 0.5),
+                "bottom": int(canvas_h * 0.72 - cap_clip.h * 0.5),
             }
             layers.append(cap_clip.set_position(("center", y_pos_map[caption_pos])))
 
+        # Нижний CTA / титр
+        if enable_caption and cta_text.strip():
+            cta_arr = create_hook_text_image(
+                text=cta_text,
+                canvas_w=canvas_w,
+                font_size=max(22, int(caption_size * 0.68)),
+                text_color="#FFE066",
+                box_bg=True,
+            )
+            cta_clip = ImageClip(cta_arr).set_duration(target_duration)
+            if fade_t > 0:
+                cta_clip = cta_clip.crossfadein(fade_t).crossfadeout(fade_t)
+            cta_y = int(canvas_h * 0.82)
+            layers.append(cta_clip.set_position(("center", cta_y)))
+
+        # Водяной знак
         wm_clip = None
         if wm_type == "Текст" and wm_text.strip():
             wm_arr = create_text_watermark(wm_text, wm_opacity)
@@ -526,3 +679,7 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         mime="video/mp4",
         use_container_width=True,
     )
+
+    st.subheader("📋 Готовое описание и хештеги")
+    publish_text = build_publish_copy(caption_text, cta_text, wm_text)
+    st.code(publish_text, language="text")
