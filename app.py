@@ -167,15 +167,19 @@ def create_text_watermark(text: str, opacity: float) -> np.ndarray:
 
 
 def make_blurred_background(frame: np.ndarray, target_w: int = 1080, target_h: int = 1920) -> np.ndarray:
-    pil_img = Image.fromarray(frame)
+    pil_img = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
     bg = pil_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=35))
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
     dark_overlay = Image.new("RGB", (target_w, target_h), (0, 0, 0))
     bg = Image.blend(bg, dark_overlay, alpha=0.35)
-    return np.array(bg)
+    return np.array(bg, dtype=np.uint8)
 
 
-def load_gif_clip(gif_path: str, loop_mode: str, target_size: tuple[int, int] | None = None) -> ImageSequenceClip:
+def load_gif_clip(
+    gif_path: str,
+    loop_mode: str,
+    target_size: tuple[int, int] | None = None,
+) -> ImageSequenceClip:
     """Читает кадры GIF через Pillow, собирает цикл и при необходимости приводит к общему размеру."""
     with Image.open(gif_path) as im:
         durations_ms = []
@@ -194,7 +198,7 @@ def load_gif_clip(gif_path: str, loop_mode: str, target_size: tuple[int, int] | 
             for f in pil_frames
         ]
 
-    rgb_frames = [np.array(f) for f in pil_frames]
+    rgb_frames = [np.array(f, dtype=np.uint8) for f in pil_frames]
 
     avg_duration_ms = sum(durations_ms) / len(durations_ms) if durations_ms else 100.0
     if avg_duration_ms < 20:
@@ -218,7 +222,6 @@ def build_combined_gif_clip(gif_paths: list[str], loop_mode: str):
         with Image.open(p) as im:
             sizes.append(im.size)
 
-    # Берём максимальные размеры среди загруженных GIF, чтобы ничего не обрезалось на этапе склейки
     common_w = max(w for w, _ in sizes)
     common_h = max(h for _, h in sizes)
     common_size = (common_w, common_h)
@@ -227,7 +230,6 @@ def build_combined_gif_clip(gif_paths: list[str], loop_mode: str):
     if len(clips) == 1:
         return clips[0]
 
-    # Приводим клипы к единому FPS перед конкатенацией
     target_fps = max(c.fps for c in clips)
     normalized = [c.set_fps(target_fps) for c in clips]
     return concatenate_videoclips(normalized, method="compose")
@@ -364,14 +366,18 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
             # Форматирование под 9:16 или оригинал
             if format_mode == "9:16 (TikTok / Shorts) с размытым фоном":
                 target_w, target_h = 1080, 1920
-                bg_clip = video.fl_image(lambda img: make_blurred_background(img, target_w, target_h))
+                first_frame = video.get_frame(0)
+                bg_array = make_blurred_background(first_frame, target_w, target_h)
+                bg_clip = ImageClip(bg_array).set_duration(target_duration)
+
                 fg_clip = video.resize(width=target_w)
                 if fg_clip.h > target_h:
                     fg_clip = video.resize(height=target_h)
+
                 video = CompositeVideoClip(
-                    [bg_clip, fg_clip.set_position("center")],
+                    [bg_clip, fg_clip.set_position(("center", "center"))],
                     size=(target_w, target_h),
-                )
+                ).set_duration(target_duration)
             elif format_mode == "9:16 (Заполнение / Crop)":
                 target_w, target_h = 1080, 1920
                 video = video.resize(height=target_h)
@@ -386,25 +392,30 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
 
             # Плавный зум
             if motion_mode == "Плавный зум (Ken Burns)" and target_duration > 0:
-                video = video.resize(lambda t: 1.0 + 0.08 * (t / target_duration))
-                video = CompositeVideoClip([video.set_position("center")], size=(video.w, video.h))
+                canvas_w, canvas_h = video.w, video.h
+                zoomed = video.resize(lambda t: 1.0 + 0.08 * (t / target_duration))
+                video = CompositeVideoClip(
+                    [zoomed.set_position(("center", "center"))],
+                    size=(canvas_w, canvas_h),
+                ).set_duration(target_duration)
 
-            layers = [video]
+            canvas_w, canvas_h = video.w, video.h
+            layers = [video.set_position((0, 0))]
 
             # Текст / хук поверх видео
             if enable_caption and caption_text.strip():
                 cap_arr = create_hook_text_image(
                     text=caption_text,
-                    canvas_w=video.w,
+                    canvas_w=canvas_w,
                     font_size=caption_size,
                     text_color=caption_color,
                     box_bg=caption_box,
                 )
                 cap_clip = ImageClip(cap_arr).set_duration(target_duration)
                 y_pos_map = {
-                    "top": int(video.h * 0.12),
-                    "center": int((video.h - cap_clip.h) * 0.5),
-                    "bottom": int(video.h * 0.76 - cap_clip.h * 0.5),
+                    "top": int(canvas_h * 0.12),
+                    "center": int((canvas_h - cap_clip.h) * 0.5),
+                    "bottom": int(canvas_h * 0.76 - cap_clip.h * 0.5),
                 }
                 layers.append(cap_clip.set_position(("center", y_pos_map[caption_pos])))
 
@@ -419,7 +430,7 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
                     f.write(wm_image.read())
                 wm_clip = (
                     ImageClip(wm_path)
-                    .resize(width=max(80, int(video.w * 0.24)))
+                    .resize(width=max(80, int(canvas_w * 0.24)))
                     .set_opacity(wm_opacity)
                     .set_duration(target_duration)
                 )
@@ -427,15 +438,15 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
             if wm_clip is not None:
                 margin = 36
                 pos_map = {
-                    "bottom-right": (video.w - wm_clip.w - margin, video.h - wm_clip.h - margin),
-                    "bottom-left": (margin, video.h - wm_clip.h - margin),
-                    "top-right": (video.w - wm_clip.w - margin, margin),
+                    "bottom-right": (canvas_w - wm_clip.w - margin, canvas_h - wm_clip.h - margin),
+                    "bottom-left": (margin, canvas_h - wm_clip.h - margin),
+                    "top-right": (canvas_w - wm_clip.w - margin, margin),
                     "top-left": (margin, margin),
                     "center": ("center", "center"),
                 }
                 layers.append(wm_clip.set_position(pos_map[wm_position]))
 
-            final_video = CompositeVideoClip(layers)
+            final_video = CompositeVideoClip(layers, size=(canvas_w, canvas_h)).set_duration(target_duration)
 
             if audio_clip is not None:
                 start_t = min(float(audio_start_sec), max(0.0, audio_clip.duration - 0.5))
