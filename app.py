@@ -63,7 +63,7 @@ st.markdown(
 )
 
 st.title("🎬 GIF → TikTok / Shorts Studio")
-st.caption("Склейка нескольких GIF, бесшовный цикл, текст/хук, музыка и водяной знак.")
+st.caption("Склейка нескольких GIF, переходы, бесшовный цикл, текст/хук, музыка и водяной знак.")
 
 
 def load_font(size: int):
@@ -166,10 +166,10 @@ def create_text_watermark(text: str, opacity: float) -> np.ndarray:
     return np.array(img)
 
 
-def make_blurred_background(frame: np.ndarray, target_w: int = 1080, target_h: int = 1920) -> np.ndarray:
+def make_blurred_background(frame: np.ndarray, target_w: int = 720, target_h: int = 1280) -> np.ndarray:
     pil_img = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
-    bg = pil_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
+    bg = pil_img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=24))
     dark_overlay = Image.new("RGB", (target_w, target_h), (0, 0, 0))
     bg = Image.blend(bg, dark_overlay, alpha=0.35)
     return np.array(bg, dtype=np.uint8)
@@ -194,7 +194,7 @@ def load_gif_clip(
     if target_size is not None:
         tw, th = target_size
         pil_frames = [
-            f.resize((tw, th), Image.Resampling.LANCZOS) if f.size != (tw, th) else f
+            f.resize((tw, th), Image.Resampling.BILINEAR) if f.size != (tw, th) else f
             for f in pil_frames
         ]
 
@@ -203,7 +203,7 @@ def load_gif_clip(
     avg_duration_ms = sum(durations_ms) / len(durations_ms) if durations_ms else 100.0
     if avg_duration_ms < 20:
         avg_duration_ms = 100.0
-    fps = max(8.0, min(30.0, 1000.0 / avg_duration_ms))
+    fps = max(8.0, min(24.0, 1000.0 / avg_duration_ms))
 
     if loop_mode == "Ping-Pong (Бумеранг)" and len(rgb_frames) > 2:
         sequence = rgb_frames + rgb_frames[-2:0:-1]
@@ -215,8 +215,13 @@ def load_gif_clip(
     return ImageSequenceClip(sequence, fps=fps)
 
 
-def build_combined_gif_clip(gif_paths: list[str], loop_mode: str):
-    """Склеивает несколько GIF в один клип с общим размером кадров для безопасного concatenate."""
+def build_combined_gif_clip(
+    gif_paths: list[str],
+    loop_mode: str,
+    transition_mode: str = "Без перехода (стык)",
+    fade_duration: float = 0.35,
+):
+    """Склеивает несколько GIF в один клип с опциональным лёгким crossfade между ними."""
     sizes = []
     for p in gif_paths:
         with Image.open(p) as im:
@@ -232,6 +237,20 @@ def build_combined_gif_clip(gif_paths: list[str], loop_mode: str):
 
     target_fps = max(c.fps for c in clips)
     normalized = [c.set_fps(target_fps) for c in clips]
+
+    if transition_mode == "Плавный crossfade":
+        min_dur = min(c.duration for c in normalized)
+        safe_fade = round(min(float(fade_duration), max(0.05, min_dur * 0.4)), 3)
+        if min_dur > safe_fade * 1.5 and safe_fade > 0:
+            faded_clips = [normalized[0]] + [
+                c.crossfadein(safe_fade) for c in normalized[1:]
+            ]
+            return concatenate_videoclips(
+                faded_clips,
+                padding=-safe_fade,
+                method="compose",
+            )
+
     return concatenate_videoclips(normalized, method="compose")
 
 
@@ -247,13 +266,28 @@ if gif_files:
 
 audio_file = st.file_uploader("Аудиодорожка (MP3 / WAV)", type=["mp3", "wav"])
 
-# --- 2. ЦИКЛ, ФОРМАТ И ДЛИТЕЛЬНОСТЬ ---
-st.subheader("2. Цикл и формат")
+# --- 2. ЦИКЛ, ПЕРЕХОДЫ, ФОРМАТ И ДЛИТЕЛЬНОСТЬ ---
+st.subheader("2. Цикл, переходы и формат")
 loop_mode = st.selectbox(
     "Бесшовный цикл каждого GIF",
     ["Ping-Pong (Бумеранг)", "Обычный повтор (Loop)"],
     help="Ping-Pong проигрывает каждый GIF вперед и назад перед переходом к следующему.",
 )
+transition_mode = st.selectbox(
+    "Переход между склеенными GIF",
+    ["Без перехода (стык)", "Плавный crossfade"],
+    help="Crossfade мягко смешивает кадры на стыке GIF без замедления всего остального ролика.",
+)
+fade_duration = 0.35
+if transition_mode == "Плавный crossfade":
+    fade_duration = st.slider(
+        "Длительность перехода (сек)",
+        min_value=0.15,
+        max_value=0.80,
+        value=0.35,
+        step=0.05,
+    )
+
 format_mode = st.selectbox(
     "Формат кадра",
     [
@@ -262,16 +296,21 @@ format_mode = st.selectbox(
         "Оригинальный размер",
     ],
 )
+quality_mode = st.selectbox(
+    "Разрешение и скорость рендера",
+    ["720x1280 (Быстрый рендер)", "1080x1920 (Full HD, медленнее)"],
+    help="720x1280 рендерится заметно быстрее на бесплатном сервере.",
+)
 motion_mode = st.selectbox(
     "Движение камеры",
     ["Без дополнительного зума", "Плавный зум (Ken Burns)"],
-    help="Добавляет легкое приближение во время ролика, чтобы картинка выглядела живее.",
+    help="Плавный зум дополнительно нагружает процессор при рендере каждого кадра.",
 )
 
 duration_mode = st.selectbox("Длительность видео", ["По длине аудио", "Фиксированная (сек)"])
-custom_duration = 15
+custom_duration = 12
 if duration_mode == "Фиксированная (сек)" or audio_file is None:
-    custom_duration = st.slider("Длительность (сек)", min_value=3, max_value=60, value=15)
+    custom_duration = st.slider("Длительность (сек)", min_value=3, max_value=45, value=12)
 
 # --- 3. НАСТРОЙКИ АУДИО ---
 audio_volume = 0.85
@@ -288,7 +327,7 @@ caption_text = ""
 caption_pos = "top"
 caption_color = "#FFFFFF"
 caption_box = True
-caption_size = 52
+caption_size = 48
 
 if enable_caption:
     caption_text = st.text_area(
@@ -299,7 +338,7 @@ if enable_caption:
     caption_pos = st.selectbox("Позиция текста", ["top", "center", "bottom"])
     caption_color = st.color_picker("Цвет текста", "#FFFFFF")
     caption_box = st.checkbox("Темная подложка под текст", value=True)
-    caption_size = st.slider("Размер шрифта", min_value=28, max_value=84, value=52)
+    caption_size = st.slider("Размер шрифта", min_value=24, max_value=80, value=48)
 
 # --- 5. ВОДЯНОЙ ЗНАК ---
 st.subheader("5. Водяной знак")
@@ -333,150 +372,157 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         st.stop()
 
     if len(gif_files) > 10:
-        st.warning("Для стабильной работы на бесплатном сервере выберите до 10 GIF за один запуск.")
-        st.stop()
+        st.info(f"Выбрано {len(gif_files)} GIF — рендер может занять больше времени и памяти на бесплатном сервере.")
 
-    with st.spinner("Собираем ролик из GIF... Обычно это занимает 15–50 секунд."):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            gif_paths = []
-            for idx, gf in enumerate(gif_files):
-                p = os.path.join(tmpdir, f"input_{idx}.gif")
-                with open(p, "wb") as f:
-                    f.write(gf.read())
-                gif_paths.append(p)
+    status_box = st.empty()
+    status_box.info("Шаг 1/3: Читаем GIF и собираем цикл...")
 
-            base_loop = build_combined_gif_clip(gif_paths, loop_mode)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gif_paths = []
+        for idx, gf in enumerate(gif_files):
+            p = os.path.join(tmpdir, f"input_{idx}.gif")
+            with open(p, "wb") as f:
+                f.write(gf.read())
+            gif_paths.append(p)
 
-            # Аудио и длительность
-            audio_clip = None
-            if audio_file is not None:
-                audio_path = os.path.join(tmpdir, "audio_input")
-                with open(audio_path, "wb") as f:
-                    f.write(audio_file.read())
-                audio_clip = AudioFileClip(audio_path)
+        base_loop = build_combined_gif_clip(
+            gif_paths,
+            loop_mode=loop_mode,
+            transition_mode=transition_mode,
+            fade_duration=fade_duration,
+        )
 
-            if duration_mode == "По длине аудио" and audio_clip is not None:
-                available_audio = max(1.0, audio_clip.duration - float(audio_start_sec))
-                target_duration = min(60.0, available_audio)
-            else:
-                target_duration = float(custom_duration)
+        audio_clip = None
+        if audio_file is not None:
+            audio_path = os.path.join(tmpdir, "audio_input")
+            with open(audio_path, "wb") as f:
+                f.write(audio_file.read())
+            audio_clip = AudioFileClip(audio_path)
 
-            video = base_loop.fx(vfx.loop, duration=target_duration)
+        if duration_mode == "По длине аудио" and audio_clip is not None:
+            available_audio = max(1.0, audio_clip.duration - float(audio_start_sec))
+            target_duration = min(45.0, available_audio)
+        else:
+            target_duration = float(custom_duration)
 
-            # Форматирование под 9:16 или оригинал
-            if format_mode == "9:16 (TikTok / Shorts) с размытым фоном":
-                target_w, target_h = 1080, 1920
-                first_frame = video.get_frame(0)
-                bg_array = make_blurred_background(first_frame, target_w, target_h)
-                bg_clip = ImageClip(bg_array).set_duration(target_duration)
+        video = base_loop.fx(vfx.loop, duration=target_duration)
 
-                fg_clip = video.resize(width=target_w)
-                if fg_clip.h > target_h:
-                    fg_clip = video.resize(height=target_h)
+        status_box.info("Шаг 2/3: Форматируем кадр и накладываем слои...")
+        is_full_hd = "1080x1920" in quality_mode
+        target_w, target_h = (1080, 1920) if is_full_hd else (720, 1280)
+        out_fps = 24 if is_full_hd else 20
 
-                video = CompositeVideoClip(
-                    [bg_clip, fg_clip.set_position(("center", "center"))],
-                    size=(target_w, target_h),
-                ).set_duration(target_duration)
-            elif format_mode == "9:16 (Заполнение / Crop)":
-                target_w, target_h = 1080, 1920
-                video = video.resize(height=target_h)
-                if video.w < target_w:
-                    video = video.resize(width=target_w)
-                video = video.crop(
-                    x_center=video.w / 2,
-                    y_center=video.h / 2,
-                    width=target_w,
-                    height=target_h,
-                )
+        if format_mode == "9:16 (TikTok / Shorts) с размытым фоном":
+            first_frame = video.get_frame(0)
+            bg_array = make_blurred_background(first_frame, target_w, target_h)
+            bg_clip = ImageClip(bg_array).set_duration(target_duration)
 
-            # Плавный зум
-            if motion_mode == "Плавный зум (Ken Burns)" and target_duration > 0:
-                canvas_w, canvas_h = video.w, video.h
-                zoomed = video.resize(lambda t: 1.0 + 0.08 * (t / target_duration))
-                video = CompositeVideoClip(
-                    [zoomed.set_position(("center", "center"))],
-                    size=(canvas_w, canvas_h),
-                ).set_duration(target_duration)
+            fg_clip = video.resize(width=target_w)
+            if fg_clip.h > target_h:
+                fg_clip = video.resize(height=target_h)
 
+            video = CompositeVideoClip(
+                [bg_clip, fg_clip.set_position(("center", "center"))],
+                size=(target_w, target_h),
+            ).set_duration(target_duration)
+        elif format_mode == "9:16 (Заполнение / Crop)":
+            video = video.resize(height=target_h)
+            if video.w < target_w:
+                video = video.resize(width=target_w)
+            video = video.crop(
+                x_center=video.w / 2,
+                y_center=video.h / 2,
+                width=target_w,
+                height=target_h,
+            )
+
+        if motion_mode == "Плавный зум (Ken Burns)" and target_duration > 0:
             canvas_w, canvas_h = video.w, video.h
-            layers = [video.set_position((0, 0))]
+            zoomed = video.resize(lambda t: 1.0 + 0.08 * (t / target_duration))
+            video = CompositeVideoClip(
+                [zoomed.set_position(("center", "center"))],
+                size=(canvas_w, canvas_h),
+            ).set_duration(target_duration)
 
-            # Текст / хук поверх видео
-            if enable_caption and caption_text.strip():
-                cap_arr = create_hook_text_image(
-                    text=caption_text,
-                    canvas_w=canvas_w,
-                    font_size=caption_size,
-                    text_color=caption_color,
-                    box_bg=caption_box,
-                )
-                cap_clip = ImageClip(cap_arr).set_duration(target_duration)
-                y_pos_map = {
-                    "top": int(canvas_h * 0.12),
-                    "center": int((canvas_h - cap_clip.h) * 0.5),
-                    "bottom": int(canvas_h * 0.76 - cap_clip.h * 0.5),
-                }
-                layers.append(cap_clip.set_position(("center", y_pos_map[caption_pos])))
+        canvas_w, canvas_h = video.w, video.h
+        layers = [video.set_position((0, 0))]
 
-            # Водяной знак
-            wm_clip = None
-            if wm_type == "Текст" and wm_text.strip():
-                wm_arr = create_text_watermark(wm_text, wm_opacity)
-                wm_clip = ImageClip(wm_arr).set_duration(target_duration)
-            elif wm_type == "Картинка (PNG)" and wm_image is not None:
-                wm_path = os.path.join(tmpdir, "wm.png")
-                with open(wm_path, "wb") as f:
-                    f.write(wm_image.read())
-                wm_clip = (
-                    ImageClip(wm_path)
-                    .resize(width=max(80, int(canvas_w * 0.24)))
-                    .set_opacity(wm_opacity)
-                    .set_duration(target_duration)
-                )
+        if enable_caption and caption_text.strip():
+            cap_arr = create_hook_text_image(
+                text=caption_text,
+                canvas_w=canvas_w,
+                font_size=caption_size,
+                text_color=caption_color,
+                box_bg=caption_box,
+            )
+            cap_clip = ImageClip(cap_arr).set_duration(target_duration)
+            y_pos_map = {
+                "top": int(canvas_h * 0.12),
+                "center": int((canvas_h - cap_clip.h) * 0.5),
+                "bottom": int(canvas_h * 0.76 - cap_clip.h * 0.5),
+            }
+            layers.append(cap_clip.set_position(("center", y_pos_map[caption_pos])))
 
-            if wm_clip is not None:
-                margin = 36
-                pos_map = {
-                    "bottom-right": (canvas_w - wm_clip.w - margin, canvas_h - wm_clip.h - margin),
-                    "bottom-left": (margin, canvas_h - wm_clip.h - margin),
-                    "top-right": (canvas_w - wm_clip.w - margin, margin),
-                    "top-left": (margin, margin),
-                    "center": ("center", "center"),
-                }
-                layers.append(wm_clip.set_position(pos_map[wm_position]))
-
-            final_video = CompositeVideoClip(layers, size=(canvas_w, canvas_h)).set_duration(target_duration)
-
-            if audio_clip is not None:
-                start_t = min(float(audio_start_sec), max(0.0, audio_clip.duration - 0.5))
-                end_t = min(audio_clip.duration, start_t + target_duration)
-                trimmed_audio = (
-                    audio_clip.subclip(start_t, end_t)
-                    .volumex(audio_volume)
-                    .audio_fadeout(1.0)
-                )
-                final_video = final_video.set_audio(trimmed_audio)
-
-            output_path = os.path.join(tmpdir, "shorts_output.mp4")
-            final_video.write_videofile(
-                output_path,
-                fps=24,
-                codec="libx264",
-                audio_codec="aac",
-                preset="fast",
-                logger=None,
+        wm_clip = None
+        if wm_type == "Текст" and wm_text.strip():
+            wm_arr = create_text_watermark(wm_text, wm_opacity)
+            wm_clip = ImageClip(wm_arr).set_duration(target_duration)
+        elif wm_type == "Картинка (PNG)" and wm_image is not None:
+            wm_path = os.path.join(tmpdir, "wm.png")
+            with open(wm_path, "wb") as f:
+                f.write(wm_image.read())
+            wm_clip = (
+                ImageClip(wm_path)
+                .resize(width=max(80, int(canvas_w * 0.24)))
+                .set_opacity(wm_opacity)
+                .set_duration(target_duration)
             )
 
-            with open(output_path, "rb") as f:
-                video_bytes = f.read()
+        if wm_clip is not None:
+            margin = 36
+            pos_map = {
+                "bottom-right": (canvas_w - wm_clip.w - margin, canvas_h - wm_clip.h - margin),
+                "bottom-left": (margin, canvas_h - wm_clip.h - margin),
+                "top-right": (canvas_w - wm_clip.w - margin, margin),
+                "top-left": (margin, margin),
+                "center": ("center", "center"),
+            }
+            layers.append(wm_clip.set_position(pos_map[wm_position]))
 
-            st.success("Видео готово!")
-            st.video(video_bytes)
-            st.download_button(
-                label="⬇️ Скачать MP4",
-                data=video_bytes,
-                file_name="tiktok_shorts_video.mp4",
-                mime="video/mp4",
-                use_container_width=True,
+        final_video = CompositeVideoClip(layers, size=(canvas_w, canvas_h)).set_duration(target_duration)
+
+        if audio_clip is not None:
+            start_t = min(float(audio_start_sec), max(0.0, audio_clip.duration - 0.5))
+            end_t = min(audio_clip.duration, start_t + target_duration)
+            trimmed_audio = (
+                audio_clip.subclip(start_t, end_t)
+                .volumex(audio_volume)
+                .audio_fadeout(1.0)
             )
+            final_video = final_video.set_audio(trimmed_audio)
+
+        status_box.info("Шаг 3/3: Кодируем MP4...")
+        output_path = os.path.join(tmpdir, "shorts_output.mp4")
+        final_video.write_videofile(
+            output_path,
+            fps=out_fps,
+            codec="libx264",
+            audio_codec="aac",
+            preset="ultrafast",
+            threads=2,
+            logger=None,
+        )
+
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+
+    status_box.empty()
+    st.success("Видео готово!")
+    st.video(video_bytes)
+    st.download_button(
+        label="⬇️ Скачать MP4",
+        data=video_bytes,
+        file_name="tiktok_shorts_video.mp4",
+        mime="video/mp4",
+        use_container_width=True,
+    )
