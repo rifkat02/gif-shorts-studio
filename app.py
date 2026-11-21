@@ -1,3 +1,4 @@
+import gc
 import os
 import random
 import tempfile
@@ -206,37 +207,51 @@ def make_blurred_background(frame: np.ndarray, target_w: int = 720, target_h: in
     return np.array(bg, dtype=np.uint8)
 
 
+def fit_frame_to_box(frame: Image.Image, box_w: int, box_h: int) -> Image.Image:
+    """Вписывает кадр в рамку box_w x box_h с сохранением пропорций, чтобы не раздувать RAM."""
+    rgb = frame.convert("RGB")
+    w, h = rgb.size
+    if w <= 0 or h <= 0:
+        return rgb
+    scale = min(box_w / w, box_h / h, 1.0)
+    new_w = max(2, int(round(w * scale)))
+    new_h = max(2, int(round(h * scale)))
+    if (new_w, new_h) != (w, h):
+        rgb = rgb.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    canvas = Image.new("RGB", (box_w, box_h), (0, 0, 0))
+    offset_x = (box_w - new_w) // 2
+    offset_y = (box_h - new_h) // 2
+    canvas.paste(rgb, (offset_x, offset_y))
+    return canvas
+
+
 def load_gif_clip(
     gif_path: str,
     loop_mode: str,
     speed_mult: float = 1.0,
-    target_size: tuple[int, int] | None = None,
+    common_box: tuple[int, int] = (720, 720),
+    max_frames_per_gif: int = 80,
 ) -> ImageSequenceClip:
-    """Читает кадры GIF через Pillow, собирает цикл, задаёт скорость и размер."""
+    """Читает кадры GIF экономично по памяти, собирает цикл и задаёт скорость."""
+    box_w, box_h = common_box
     with Image.open(gif_path) as im:
         durations_ms = []
-        pil_frames = []
-        for frame in ImageSequence.Iterator(im):
+        rgb_frames = []
+        for idx, frame in enumerate(ImageSequence.Iterator(im)):
+            if idx >= max_frames_per_gif:
+                break
             durations_ms.append(frame.info.get("duration", 100))
-            pil_frames.append(frame.convert("RGB"))
+            fitted = fit_frame_to_box(frame, box_w, box_h)
+            rgb_frames.append(np.array(fitted, dtype=np.uint8))
 
-    if not pil_frames:
+    if not rgb_frames:
         raise ValueError("Не удалось прочитать кадры из GIF-файла.")
-
-    if target_size is not None:
-        tw, th = target_size
-        pil_frames = [
-            f.resize((tw, th), Image.Resampling.BILINEAR) if f.size != (tw, th) else f
-            for f in pil_frames
-        ]
-
-    rgb_frames = [np.array(f, dtype=np.uint8) for f in pil_frames]
 
     avg_duration_ms = sum(durations_ms) / len(durations_ms) if durations_ms else 100.0
     if avg_duration_ms < 20:
         avg_duration_ms = 100.0
-    base_fps = max(8.0, min(24.0, 1000.0 / avg_duration_ms))
-    fps = max(6.0, min(30.0, base_fps * float(speed_mult)))
+    base_fps = max(8.0, min(20.0, 1000.0 / avg_duration_ms))
+    fps = max(6.0, min(24.0, base_fps * float(speed_mult)))
 
     if loop_mode == "Ping-Pong (Бумеранг)" and len(rgb_frames) > 2:
         sequence = rgb_frames + rgb_frames[-2:0:-1]
@@ -254,21 +269,33 @@ def build_combined_gif_clip(
     speed_mult: float = 1.0,
     transition_mode: str = "Без перехода (стык)",
     fade_duration: float = 0.35,
+    is_full_hd: bool = False,
 ):
-    """Склеивает несколько GIF в один клип с общим размером кадров и опциональным crossfade."""
-    sizes = []
+    """Склеивает несколько GIF в один клип с экономией памяти на слабом сервере."""
+    num_files = len(gif_paths)
+    # При большом числе файлов ограничиваем рабочий размер кадров и число кадров на гифку
+    if num_files >= 10:
+        common_box = (480, 480) if not is_full_hd else (640, 640)
+        max_frames = 45
+    elif num_files >= 5:
+        common_box = (540, 540) if not is_full_hd else (720, 720)
+        max_frames = 60
+    else:
+        common_box = (720, 720) if not is_full_hd else (900, 900)
+        max_frames = 80
+
+    clips = []
     for p in gif_paths:
-        with Image.open(p) as im:
-            sizes.append(im.size)
+        c = load_gif_clip(
+            p,
+            loop_mode=loop_mode,
+            speed_mult=speed_mult,
+            common_box=common_box,
+            max_frames_per_gif=max_frames,
+        )
+        clips.append(c)
+        gc.collect()
 
-    common_w = max(w for w, _ in sizes)
-    common_h = max(h for _, h in sizes)
-    common_size = (common_w, common_h)
-
-    clips = [
-        load_gif_clip(p, loop_mode, speed_mult=speed_mult, target_size=common_size)
-        for p in gif_paths
-    ]
     if len(clips) == 1:
         return clips[0]
 
@@ -282,13 +309,19 @@ def build_combined_gif_clip(
             faded_clips = [normalized[0]] + [
                 c.crossfadein(safe_fade) for c in normalized[1:]
             ]
-            return concatenate_videoclips(
+            combined = concatenate_videoclips(
                 faded_clips,
                 padding=-safe_fade,
                 method="compose",
             )
+            for c in normalized:
+                c.close()
+            return combined
 
-    return concatenate_videoclips(normalized, method="compose")
+    combined = concatenate_videoclips(normalized, method="compose")
+    for c in normalized:
+        c.close()
+    return combined
 
 
 def estimate_render_seconds(
@@ -350,6 +383,11 @@ if gif_files:
         f"{'Порядок перемешается случайно' if shuffle_gifs else 'Порядок по списку'} | "
         f"Темп {gif_speed}x"
     )
+    if total_mb > 35:
+        st.warning(
+            f"Суммарный размер файлов ~{total_mb:.1f} МБ. На бесплатном сервере при большом объёме GIF "
+            "лучше выбирать 720x1280 и длительность до 15–20 сек, чтобы не исчерпать память."
+        )
 
 audio_file = st.file_uploader("Аудиодорожка (MP3 / WAV)", type=["mp3", "wav"])
 if audio_file is not None:
@@ -391,12 +429,12 @@ format_mode = st.selectbox(
 quality_mode = st.selectbox(
     "Разрешение и скорость рендера",
     ["720x1280 (Быстрый рендер)", "1080x1920 (Full HD, медленнее)"],
-    help="720x1280 рендерится заметно быстрее на бесплатном сервере.",
+    help="720x1280 рендерится заметно быстрее и тратит меньше памяти на бесплатном сервере.",
 )
 motion_mode = st.selectbox(
     "Движение камеры",
     ["Без дополнительного зума", "Плавный зум (Ken Burns)"],
-    help="Плавный зум дополнительно нагружает процессор при рендере каждого кадра.",
+    help="Плавный зум дополнительно нагружает процессор и память при рендере каждого кадра.",
 )
 
 duration_mode = st.selectbox("Длительность видео", ["По длине аудио", "Фиксированная (сек)"])
@@ -498,9 +536,6 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         st.error("Сначала загрузите хотя бы один GIF-файл.")
         st.stop()
 
-    if len(gif_files) > 10:
-        st.info(f"Выбрано {len(gif_files)} GIF — рендер может занять больше времени и памяти на бесплатном сервере.")
-
     status_box = st.empty()
     status_box.info("Шаг 1/3: Читаем GIF и собираем цикл...")
 
@@ -508,12 +543,16 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
     if shuffle_gifs and len(ordered_gifs) > 1:
         random.shuffle(ordered_gifs)
 
+    is_full_hd = "1080x1920" in quality_mode
+    target_w, target_h = (1080, 1920) if is_full_hd else (720, 1280)
+    out_fps = 24 if is_full_hd else 20
+
     with tempfile.TemporaryDirectory() as tmpdir:
         gif_paths = []
         for idx, gf in enumerate(ordered_gifs):
             p = os.path.join(tmpdir, f"input_{idx}.gif")
             with open(p, "wb") as f:
-                f.write(gf.read())
+                f.write(gf.getvalue())
             gif_paths.append(p)
 
         base_loop = build_combined_gif_clip(
@@ -522,13 +561,15 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
             speed_mult=gif_speed,
             transition_mode=transition_mode,
             fade_duration=fade_duration,
+            is_full_hd=is_full_hd,
         )
 
         audio_clip = None
+        trimmed_audio = None
         if audio_file is not None:
             audio_path = os.path.join(tmpdir, "audio_input")
             with open(audio_path, "wb") as f:
-                f.write(audio_file.read())
+                f.write(audio_file.getvalue())
             audio_clip = AudioFileClip(audio_path)
 
         if duration_mode == "По длине аудио" and audio_clip is not None:
@@ -540,9 +581,6 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         video = base_loop.fx(vfx.loop, duration=target_duration)
 
         status_box.info("Шаг 2/3: Форматируем кадр и накладываем слои...")
-        is_full_hd = "1080x1920" in quality_mode
-        target_w, target_h = (1080, 1920) if is_full_hd else (720, 1280)
-        out_fps = 24 if is_full_hd else 20
 
         if format_mode == "9:16 (TikTok / Shorts) с размытым фоном":
             first_frame = video.get_frame(0)
@@ -581,7 +619,6 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
 
         fade_t = min(0.25, target_duration * 0.15) if smooth_text_fade else 0.0
 
-        # Основной текст / хук поверх видео
         if enable_caption and caption_text.strip():
             cap_arr = create_hook_text_image(
                 text=caption_text,
@@ -600,7 +637,6 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
             }
             layers.append(cap_clip.set_position(("center", y_pos_map[caption_pos])))
 
-        # Нижний CTA / титр
         if enable_caption and cta_text.strip():
             cta_arr = create_hook_text_image(
                 text=cta_text,
@@ -615,7 +651,6 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
             cta_y = int(canvas_h * 0.82)
             layers.append(cta_clip.set_position(("center", cta_y)))
 
-        # Водяной знак
         wm_clip = None
         if wm_type == "Текст" and wm_text.strip():
             wm_arr = create_text_watermark(wm_text, wm_opacity)
@@ -623,7 +658,7 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
         elif wm_type == "Картинка (PNG)" and wm_image is not None:
             wm_path = os.path.join(tmpdir, "wm.png")
             with open(wm_path, "wb") as f:
-                f.write(wm_image.read())
+                f.write(wm_image.getvalue())
             wm_clip = (
                 ImageClip(wm_path)
                 .resize(width=max(80, int(canvas_w * 0.24)))
@@ -656,18 +691,42 @@ if st.button("🚀 Сгенерировать видео", type="primary", use_c
 
         status_box.info("Шаг 3/3: Кодируем MP4...")
         output_path = os.path.join(tmpdir, "shorts_output.mp4")
-        final_video.write_videofile(
-            output_path,
-            fps=out_fps,
-            codec="libx264",
-            audio_codec="aac",
-            preset="ultrafast",
-            threads=2,
-            logger=None,
-        )
-
-        with open(output_path, "rb") as f:
-            video_bytes = f.read()
+        try:
+            final_video.write_videofile(
+                output_path,
+                fps=out_fps,
+                codec="libx264",
+                audio_codec="aac",
+                preset="ultrafast",
+                threads=2,
+                logger=None,
+            )
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+        finally:
+            try:
+                final_video.close()
+            except Exception:
+                pass
+            try:
+                video.close()
+            except Exception:
+                pass
+            try:
+                base_loop.close()
+            except Exception:
+                pass
+            if trimmed_audio is not None:
+                try:
+                    trimmed_audio.close()
+                except Exception:
+                    pass
+            if audio_clip is not None:
+                try:
+                    audio_clip.close()
+                except Exception:
+                    pass
+            gc.collect()
 
     status_box.empty()
     st.success("Видео готово!")
